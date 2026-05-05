@@ -10,6 +10,12 @@ I picked this because it seemed like an interesting and useful problem. For exam
 
 I used LangChain to build the tool, and linked the tool to the `langchain-ai/langchain` repo, as it has a good amount of activity the tool could answer questions about.
 
+The implementation lives in three files:
+
+- [`agent.py`](agent.py) — Agent wiring, system prompt, and CLI entry point.
+- [`tools.py`](tools.py) — the six GitHub tools the agent can call.
+- [`github_api.py`](github_api.py) — a thin HTTP client for the GitHub REST API.
+
 ## 2. How to run it, including any env vars or API keys needed
 
 Tested with Python 3.14
