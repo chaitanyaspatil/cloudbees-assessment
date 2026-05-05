@@ -1,0 +1,11 @@
+*Reflections about using a coding assistant*
+
+1. My coding assistant, Claude Code, helped quite a lot in doing this task quickly. It helped both with boilerplate as well as design. Specifically, it knew about the GitHub API much better than I did, and could quickly spin up tools.
+2. Claude committed a few grave errors in its suggested design, and a few not-so-damning ones:
+- The codebase was built around a few sample questions that the agent should be able to answer. On its first pass of the code plan, Claude assumed the simplest of questions being asked like "What is this codebase about?". This was easy to catch since it was there in the plan it wrote up.
+- When I came up with a list of better questions, Claude leaked parts of questions in the tool docstrings to help guide agent decisions. For example, "Use as the first step when investigating 'what subsystems have problems'". This could have resulted in a system that did badly in the real world.
+3. Claude was a good sounding board for ideas. The discussion about the quality of questions the agent should be able to answer made sure the agent prompt was comprehensive. It was the most useful in the actual *writing* of code. Sometimes, it made architectural mistakes: the first version of the GitHub API helper it wrote 'knew' it was serving an agent. Additionally, Claude once wrote an expensive retry loop for a problem that we had not observed.
+4. Yes I did. It is useful, but does feel weird, and "AI spawning AI" does raise concerns like "How do we do this safely?".
+5. I have used LangSmith for observability and traceability. It required no extra code, and helped me finetune my agent prompt. It helps track latency, costs, as well as errors, and makes sharing traces simple. As project evolves, I'd use stored chats to track any regressions and add ways to get user feedback.
+6. For performance: cost and latency metrics captured in LangSmith and see how they change with prompt or model changes, tracked via replay against a dataset. 
+For reliability: A test set of questions along with expectations for that question, e.g. tool usage, expected pivots, and then analyze traces programmatically as far as possible, and then using LLM-as-a-judge as a backup. I would also add human feedback tracking.

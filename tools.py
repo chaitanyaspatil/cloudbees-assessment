@@ -7,6 +7,11 @@ noisy and burn context tokens.
 On success a tool returns a plain data dict (the trimmed fields).
 On failure it returns {"error": "<short code or message>"} so the agent
 can observe and adapt without exceptions crossing the tool boundary.
+
+Tool docstrings deliberately describe what each tool returns and how to
+call it — NOT which question shape it should be used for. Routing is the
+agent's job; documentation that pre-routes undermines the "investigate,
+not route" framing.
 """
 
 from __future__ import annotations
@@ -58,15 +63,11 @@ def _as_error(e: GitHubError) -> dict:
 def read_readme(repo: str) -> dict:
     """Fetch the README of a GitHub repo.
 
-    Use for high-level project context: what the project is, how to install,
-    headline features. Rarely the right primary source for "is it healthy"
-    or "what bugs exist" — those live in commits/issues.
-
     Args:
         repo: GitHub repo in "owner/name" form, e.g. "langchain-ai/langchain".
 
     Returns:
-        On success: {content, html_url}. content truncated to ~5000 chars.
+        On success: {content, html_url}. content is truncated to ~5000 chars.
         On failure: {error}.
     """
     try:
@@ -88,10 +89,9 @@ def read_readme(repo: str) -> dict:
 
 @tool
 def recent_commits(repo: str, days: int = 14) -> dict:
-    """List commits to the default branch in the last N days.
+    """List commits to the default branch within the last N days.
 
-    Use to assess commit cadence (project health) or to find the recent
-    change related to an issue. Returns up to 30 commits.
+    Returns up to 30 commits.
 
     Args:
         repo: GitHub repo in "owner/name" form.
@@ -125,9 +125,6 @@ def recent_commits(repo: str, days: int = 14) -> dict:
 @tool
 def list_releases(repo: str, n: int = 5) -> dict:
     """List the most recent N releases.
-
-    Use to assess release cadence, find what changed in the latest version,
-    or correlate an issue with a release date.
 
     Args:
         repo: GitHub repo in "owner/name" form.
@@ -164,10 +161,10 @@ def search_issues(
     """Search issues in a repo. Returns total_count and a trimmed item list.
 
     The query is the q-syntax for GitHub issue search, MINUS the repo qualifier
-    (which is added automatically). Examples:
+    (which is added automatically). Q-syntax examples:
       - 'streaming label:"partner: anthropic"'
       - 'label:"good first issue"'
-      - 'sort:comments-desc'  (find pile-on issues)
+      - 'sort:comments-desc'
 
     Use total_count for cheap counts (no need for a separate count tool).
     Set limit=1 if you only need the count.
@@ -217,20 +214,15 @@ def search_issues(
 def get_issue(repo: str, number: int) -> dict:
     """Fetch a single issue with its body, comments, and timeline events.
 
-    Use this to assess complexity (read body), detect claimed-in-comments
-    issues (read comments + timeline), or find the linked PR. The timeline
-    is what tells you whether someone has already started work — a label
-    search alone misses this.
-
     Args:
         repo: GitHub repo in "owner/name" form.
         number: Issue number.
 
     Returns:
         On success: {number, title, state, labels, body, assignees,
-                     comments: [...], timeline_events: [...], html_url}.
-            Comments capped at 10. Timeline filtered to assigned/cross-referenced/
-            referenced/closed events; capped at 20.
+                     comments_count, comments: [...], timeline_events: [...], html_url}.
+            Comments capped at 10. Timeline filtered to assigned/unassigned/
+            cross-referenced/referenced/closed events; capped at 20.
         On failure: {error}.
     """
     try:
@@ -292,12 +284,11 @@ def get_issue(repo: str, number: int) -> dict:
 
 @tool
 def list_labels(repo: str) -> dict:
-    """List all labels in a repo with their descriptions.
+    """List all labels defined on the repo.
 
-    Use as the first step when investigating "what subsystems have problems"
-    or any clustering question — labels often ARE the cluster taxonomy in
-    mature OSS repos. Note: this does NOT include issue counts per label.
-    To get a count, call search_issues with label:"name" and limit=1.
+    Each label includes its name, description, and color. Does NOT include
+    per-label issue counts — call search_issues with a label filter
+    (limit=1) to get a count.
 
     Args:
         repo: GitHub repo in "owner/name" form.
