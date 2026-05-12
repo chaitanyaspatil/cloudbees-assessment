@@ -1,33 +1,23 @@
 """LangChain tools the agent can call.
 
 Each tool wraps a GitHub endpoint via github_api.gh_get and trims the
-response to fields the agent actually needs. Full GitHub payloads are
-noisy and burn context tokens.
+response to fields the agent actually needs.
 
 On success a tool returns a plain data dict (the trimmed fields).
 On failure it returns {"error": "<short code or message>"} so the agent
 can observe and adapt without exceptions crossing the tool boundary.
-
-Tool docstrings deliberately describe what each tool returns and how to
-call it — NOT which question shape it should be used for. Routing is the
-agent's job; documentation that pre-routes undermines the "investigate,
-not route" framing.
 """
 
 from __future__ import annotations
 
 import base64
+import functools
 from datetime import datetime, timedelta, timezone
+import requests
 
 from langchain_core.tools import tool
+from github_api import gh_get
 
-from github_api import (
-    GitHubError,
-    NetworkError,
-    NotFound,
-    RateLimited,
-    gh_get,
-)
 
 # Length caps to keep tool outputs from blowing context.
 README_CHAR_CAP = 5000
@@ -47,38 +37,48 @@ def _truncate(text: str | None, cap: int) -> str:
     return text[:cap] + f"... [truncated, {len(text) - cap} chars omitted]"
 
 
-def _as_error(e: GitHubError) -> dict:
-    if isinstance(e, NotFound):
-        return {"error": "not_found"}
-    if isinstance(e, RateLimited):
-        return {"error": "rate_limited"}
-    if isinstance(e, NetworkError):
-        return {"error": f"network_error: {e}"}
-    return {"error": str(e)}
+# HTTP statuses where the agent can plausibly recover by changing arguments
+# (bad query, missing resource, unprocessable input)
+AGENT_FIXABLE_STATUSES = (400, 404, 422)
+
+
+def gh_safe(fn):
+    """Decorator: catch agent-fixable HTTP errors and return them as data.
+
+    Wrap any tool whose body calls gh_get(). On HTTPError with a status in
+    AGENT_FIXABLE_STATUSES, the wrapper returns {"error": str(e)} so the
+    agent observes the failure as a tool result and can adapt. Other
+    HTTPErrors and any other exceptions propagate.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except requests.HTTPError as e:
+            if e.response.status_code in AGENT_FIXABLE_STATUSES:
+                return {"error": str(e)}
+            raise
+    return wrapper
 
 
 # ---------- Tool 1: read_readme ----------
 
 @tool
+@gh_safe
 def read_readme(repo: str) -> dict:
     """Fetch the README of a GitHub repo.
 
     Args:
-        repo: GitHub repo in "owner/name" form, e.g. "langchain-ai/langchain".
+        repo: GitHub repo in "owner/name" form.
 
     Returns:
         On success: {content, html_url}. content is truncated to ~5000 chars.
-        On failure: {error}.
+        On failure: {error} if the agent can fix it (bad repo name etc.);
+        otherwise the exception propagates.
     """
-    try:
-        payload = gh_get(f"/repos/{repo}/readme")
-    except GitHubError as e:
-        return _as_error(e)
+    payload = gh_get(f"/repos/{repo}/readme")
     encoded = payload.get("content", "")
-    try:
-        decoded = base64.b64decode(encoded).decode("utf-8", errors="replace")
-    except Exception as e:
-        return {"error": f"decode_error: {e}"}
+    decoded = base64.b64decode(encoded).decode("utf-8", errors="replace")
     return {
         "content": _truncate(decoded, README_CHAR_CAP),
         "html_url": payload.get("html_url"),
@@ -88,6 +88,7 @@ def read_readme(repo: str) -> dict:
 # ---------- Tool 2: recent_commits ----------
 
 @tool
+@gh_safe
 def recent_commits(repo: str, days: int = 14) -> dict:
     """List commits to the default branch within the last N days.
 
@@ -99,13 +100,14 @@ def recent_commits(repo: str, days: int = 14) -> dict:
 
     Returns:
         On success: {count, commits: [{sha, date, author, message_first_line, html_url}]}.
-        On failure: {error}.
+        On failure: {error} if the agent can fix it (bad repo name etc.);
+        otherwise the exception propagates.
     """
+    # fetch commits
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    try:
-        data = gh_get(f"/repos/{repo}/commits", params={"since": since, "per_page": 30})
-    except GitHubError as e:
-        return _as_error(e)
+    data = gh_get(f"/repos/{repo}/commits", params={"since": since, "per_page": 30})
+    
+    # loop through commits and extract extract important data for each
     commits = []
     for c in data:
         commit = c.get("commit", {})
@@ -123,6 +125,7 @@ def recent_commits(repo: str, days: int = 14) -> dict:
 # ---------- Tool 3: list_releases ----------
 
 @tool
+@gh_safe
 def list_releases(repo: str, n: int = 5) -> dict:
     """List the most recent N releases.
 
@@ -132,12 +135,10 @@ def list_releases(repo: str, n: int = 5) -> dict:
 
     Returns:
         On success: {count, releases: [{tag_name, name, published_at, body_excerpt, html_url}]}.
-        On failure: {error}.
+        On failure: {error} if the agent can fix it (bad repo name etc.);
+        otherwise the exception propagates.
     """
-    try:
-        data = gh_get(f"/repos/{repo}/releases", params={"per_page": n})
-    except GitHubError as e:
-        return _as_error(e)
+    data = gh_get(f"/repos/{repo}/releases", params={"per_page": n})
     releases = [{
         "tag_name": r.get("tag_name"),
         "name": r.get("name"),
@@ -151,6 +152,7 @@ def list_releases(repo: str, n: int = 5) -> dict:
 # ---------- Tool 4: search_issues ----------
 
 @tool
+@gh_safe
 def search_issues(
     repo: str,
     query: str,
@@ -178,20 +180,22 @@ def search_issues(
 
     Returns:
         On success: {total_count, items: [...]}.
-        On failure: {error}.
+        On failure: {error} if the agent can fix it (bad repo name etc.);
+        otherwise the exception propagates.
     """
+    # create query
     q_parts = [f"repo:{repo}", "is:issue"]
     if state in ("open", "closed"):
         q_parts.append(f"is:{state}")
     q_parts.append(query)
     full_query = " ".join(q_parts)
 
-    try:
-        payload = gh_get("/search/issues", params={
-            "q": full_query, "sort": sort, "order": "desc", "per_page": limit,
-        })
-    except GitHubError as e:
-        return _as_error(e)
+    # get all issues corresponding to query
+    payload = gh_get("/search/issues", params={
+        "q": full_query, "sort": sort, "order": "desc", "per_page": limit,
+    })
+
+    # format each issue
     items = []
     for it in payload.get("items", []):
         items.append({
@@ -211,6 +215,7 @@ def search_issues(
 # ---------- Tool 5: get_issue ----------
 
 @tool
+@gh_safe
 def get_issue(repo: str, number: int) -> dict:
     """Fetch a single issue with its body, comments, and timeline events.
 
@@ -223,49 +228,48 @@ def get_issue(repo: str, number: int) -> dict:
                      comments_count, comments: [...], timeline_events: [...], html_url}.
             Comments capped at 10. Timeline filtered to assigned/unassigned/
             cross-referenced/referenced/closed events; capped at 20.
-        On failure: {error}.
+        On failure: {error} if the agent can fix it (bad repo name etc.);
+        otherwise the exception propagates.
     """
-    try:
-        issue = gh_get(f"/repos/{repo}/issues/{number}")
-    except GitHubError as e:
-        return _as_error(e)
+    issue = gh_get(f"/repos/{repo}/issues/{number}")
 
+    # get issue comments
     comments = []
-    try:
-        for c in gh_get(
-            f"/repos/{repo}/issues/{number}/comments",
-            params={"per_page": MAX_COMMENTS_PER_ISSUE},
-        ):
-            comments.append({
-                "user": c.get("user", {}).get("login"),
-                "created_at": c.get("created_at"),
-                "body_excerpt": _truncate(c.get("body"), COMMENT_BODY_CHAR_CAP),
-            })
-    except GitHubError:
-        pass  # comments are nice-to-have; don't fail the whole tool
+    for c in gh_get(
+        f"/repos/{repo}/issues/{number}/comments",
+        params={"per_page": MAX_COMMENTS_PER_ISSUE},
+    ):
+        comments.append({
+            "user": c.get("user", {}).get("login"),
+            "created_at": c.get("created_at"),
+            "body_excerpt": _truncate(c.get("body"), COMMENT_BODY_CHAR_CAP),
+        })
 
+    # get issue timeline
     relevant_events = {"assigned", "unassigned", "cross-referenced", "referenced", "closed"}
     timeline = []
-    try:
-        for ev in gh_get(
-            f"/repos/{repo}/issues/{number}/timeline",
-            params={"per_page": MAX_TIMELINE_EVENTS},
-        ):
-            ev_type = ev.get("event")
-            if ev_type not in relevant_events:
-                continue
-            entry = {"event": ev_type, "created_at": ev.get("created_at")}
-            if ev_type in ("assigned", "unassigned"):
-                entry["assignee"] = (ev.get("assignee") or {}).get("login")
-            if ev_type == "cross-referenced":
-                src = ev.get("source", {}).get("issue", {})
-                entry["from_issue_or_pr"] = src.get("number")
-                entry["from_html_url"] = src.get("html_url")
-                entry["is_pull_request"] = "pull_request" in src
-            timeline.append(entry)
-    except GitHubError:
-        pass
+    for event in gh_get(
+        f"/repos/{repo}/issues/{number}/timeline",
+        params={"per_page": MAX_TIMELINE_EVENTS},
+    ):
+        event_type = event.get("event")
+        if event_type not in relevant_events:
+            continue
 
+        entry = {"event": event_type, "created_at": event.get("created_at")}
+
+        if event_type in {"assigned", "unassigned"}:
+            entry["assignee"] = (event.get("assignee") or {}).get("login")
+        
+        if event_type == "cross-referenced":
+            source = event.get("source", {}).get("issue", {})
+            entry["from_issue_or_pr"] = source.get("number")
+            entry["from_html_url"] = source.get("html_url")
+            entry["is_pull_request"] = "pull_request" in source
+        
+        timeline.append(entry)
+
+    # create issue summary and return
     return {
         "number": issue.get("number"),
         "title": issue.get("title"),
@@ -283,6 +287,7 @@ def get_issue(repo: str, number: int) -> dict:
 # ---------- Tool 6: list_labels ----------
 
 @tool
+@gh_safe
 def list_labels(repo: str) -> dict:
     """List all labels defined on the repo.
 
@@ -295,12 +300,10 @@ def list_labels(repo: str) -> dict:
 
     Returns:
         On success: {count, labels: [{name, description, color}]}.
-        On failure: {error}.
+        On failure: {error} if the agent can fix it (bad repo name etc.);
+        otherwise the exception propagates.
     """
-    try:
-        data = gh_get(f"/repos/{repo}/labels", params={"per_page": 100})
-    except GitHubError as e:
-        return _as_error(e)
+    data = gh_get(f"/repos/{repo}/labels", params={"per_page": 100})
     labels = [{
         "name": l.get("name"),
         "description": l.get("description"),
